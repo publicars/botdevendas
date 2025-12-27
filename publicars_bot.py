@@ -1,5 +1,5 @@
-# --- VERSÃO v3.0 - PUBLICARS HUMANIZADO + MEMÓRIA + DASHBOARD INTEGRADO ---
-# Baseado na v2.0 estável (Audio+Texto OK)
+# --- VERSÃO v3.1 - PUBLICARS HUMANIZADO + FIX DASHBOARD + DELAY REAL ---
+# Baseado na sua versão estável v3.0
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -11,6 +11,7 @@ import pytz
 import httpx
 import random
 import hashlib
+import asyncio # Adicionado para o Delay
 from typing import Union, Optional
 import io 
 import base64 
@@ -50,7 +51,8 @@ BR_TIMEZONE = pytz.timezone('America/Sao_Paulo')
 # --- Inicialização ---
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
-httpx_client = httpx.AsyncClient(timeout=30.0)
+# Aumentei o timeout para evitar erro durante o delay humano
+httpx_client = httpx.AsyncClient(timeout=60.0)
 
 if not all([EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE_NAME, OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     logging.critical("⚠️ ERRO CRÍTICO: Variáveis de ambiente faltando!")
@@ -66,7 +68,7 @@ except Exception as e:
     logging.critical(f"💥 Falha ao inicializar clientes de API: {e}")
 
 
-# --- FUNÇÕES AUXILIARES (NOVO v3.0) ---
+# --- FUNÇÕES AUXILIARES ---
 
 # Lista de nomes para a equipe comercial
 AGENT_NAMES = [
@@ -77,7 +79,6 @@ AGENT_NAMES = [
 def get_persona_name(phone_number: str) -> str:
     """Escolhe um nome fixo para o atendente baseado no número do cliente (Hash)."""
     if not phone_number: return "Atendente Publicars"
-    # Transforma o telefone em um número único e usa para escolher o nome na lista
     hash_obj = hashlib.md5(phone_number.encode())
     hash_int = int(hash_obj.hexdigest(), 16)
     return AGENT_NAMES[hash_int % len(AGENT_NAMES)]
@@ -85,22 +86,41 @@ def get_persona_name(phone_number: str) -> str:
 def get_user_profile(phone_number: str):
     """🧠 MEMÓRIA: Busca no banco se já conhecemos este cliente (Nome/Empresa)."""
     try:
-        # Tenta buscar na tabela 'leads' se já temos cadastro desse número
         response = supabase.from_('leads').select('full_name, company_name, service_desired').eq('session_id', phone_number).limit(1).execute()
         if response.data:
-            return response.data[0] # Retorna o objeto com {full_name, company_name}
+            return response.data[0] 
         return None
     except Exception as e:
         logging.error(f"Erro ao buscar memória do usuário: {e}")
         return None
 
+# --- NOVAS FUNÇÕES DE INTERAÇÃO (Check Azul + Delay) ---
 
-# --- Função de Envio de Mensagem (Evolution API) ---
-async def send_whatsapp_message(to_number_jid: str, message: str):
+async def mark_message_as_read(remote_jid: str):
+    """✅ Marca a mensagem como lida no WhatsApp."""
+    if "@s.whatsapp.net" not in remote_jid: remote_jid = f"{remote_jid}@s.whatsapp.net"
+    try:
+        api_url = f"{EVOLUTION_API_URL}/chat/markMessageAsRead/{EVOLUTION_INSTANCE_NAME}"
+        headers = {"apiKey": EVOLUTION_API_KEY}
+        # Payload padrão da Evolution para ler mensagens
+        payload = {"readMessages": [{"remoteJid": remote_jid}]}
+        await httpx_client.post(api_url, json=payload, headers=headers)
+    except: pass
+
+async def send_whatsapp_message(to_number_jid: str, message: str, delay_seconds: int = 0):
+    """📩 Envia mensagem com delay humano e status 'digitando...'."""
     if "@s.whatsapp.net" not in to_number_jid: to_number_jid = f"{to_number_jid}@s.whatsapp.net"
+    
+    # 1. Delay Humano (Simula pensar/digitar)
+    if delay_seconds > 0:
+        logging.info(f"⏳ Aguardando {delay_seconds}s para responder {to_number_jid}...")
+        await asyncio.sleep(delay_seconds)
+
     api_url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE_NAME}"
     headers = {"apiKey": EVOLUTION_API_KEY, "ngrok-skip-browser-warning": "true"}
-    payload = {"number": to_number_jid, "options": {"delay": 1200, "presence": "composing"}, "text": message}
+    # presence: "composing" faz aparecer "Digitando..." no celular do cliente
+    payload = {"number": to_number_jid, "options": {"delay": 0, "presence": "composing"}, "text": message}
+    
     try:
         logging.info(f"📤 Enviando resposta para: {to_number_jid}")
         await httpx_client.post(api_url, json=payload, headers=headers)
@@ -121,11 +141,11 @@ async def transcribe_audio(audio_bytes: bytes, file_extension: str) -> str:
         return "[ERRO DE TRANSCRIÇÃO]"
 
 
-# --- FERRAMENTAS PUBLICARS (Sales Tools v3.0) ---
+# --- FERRAMENTAS PUBLICARS (Sales Tools v3.1) ---
 
 @tool
 def buscar_faq(query: str) -> str:
-    """❓ Busca respostas técnicas específicas no banco de dados (ex: dimensões do tablet, especificações de vídeo, detalhes de contrato)."""
+    """❓ Busca respostas técnicas específicas no banco de dados."""
     try:
         response = supabase.from_('knowledge_base').select('answer').ilike('question', f'%{query}%').limit(1).execute()
         if response.data:
@@ -136,12 +156,11 @@ def buscar_faq(query: str) -> str:
 
 @tool
 def registrar_venda_dashboard(nome: str, empresa: str, plano: str, telefone: str) -> str:
-    """📝 REGISTRA INTERESSE/VENDA. Use quando o cliente demonstra interesse claro em um plano.
-    Salva diretamente no painel administrativo da Publicars (pedidos_anuncios)."""
+    """📝 REGISTRA INTERESSE/VENDA. Salva no painel administrativo da Publicars (pedidos_anuncios)."""
     try:
         current_time = datetime.now(BR_TIMEZONE).isoformat()
         
-        # 1. Salva na tabela LEADS (Backup e Memória do Bot)
+        # 1. Salva na tabela LEADS (Backup)
         dados_lead = {
             'full_name': nome,
             'company_name': empresa,
@@ -151,16 +170,18 @@ def registrar_venda_dashboard(nome: str, empresa: str, plano: str, telefone: str
             'status': 'NOVO_LEAD_ANUNCIANTE',
             'updated_at': current_time
         }
-        supabase.from_('leads').insert(dados_lead).execute()
+        try: supabase.from_('leads').insert(dados_lead).execute()
+        except: pass
 
-        # 2. Tenta salvar na tabela PEDIDOS_ANUNCIOS (Integração com Dashboard)
+        # 2. Salva na tabela PEDIDOS_ANUNCIOS (CORRIGIDO PARA O SEU DASHBOARD)
+        # Atenção: Aqui usamos os nomes de colunas que vimos na sua imagem
         dados_dashboard = {
-            'responsavel': nome,         # Nome do cliente vai na coluna "responsavel"
-            'empresa': empresa,          # Coluna "empresa"
-            'pacote': plano,             # Coluna "pacote"
-            'status': 'NOVO',            # Status padrão
-            'telefone': telefone,        # Telefone para contato
-            'data_criacao': current_time
+            'nome_responsavel': nome,      # Corrigido de 'responsavel' para 'nome_responsavel'
+            'nome_empresa': empresa,       # Corrigido de 'empresa' para 'nome_empresa'
+            'whatsapp': telefone,          # Corrigido de 'telefone' para 'whatsapp'
+            'pacote_escolhido': plano,     # Requer a coluna nova 'pacote_escolhido'
+            'status': 'NOVO',              # Requer a coluna nova 'status'
+            # Se sua tabela tiver 'created_at' automático, não precisa mandar data_criacao
         }
         
         try:
@@ -176,8 +197,7 @@ def registrar_venda_dashboard(nome: str, empresa: str, plano: str, telefone: str
 
 @tool
 def registrar_lead_motorista(nome: str, modelo_carro: str, cidade: str, telefone: str) -> str:
-    """🚗 Registra um LEAD DE MOTORISTA (Parceiro) interessado em instalar o tablet.
-    'nome': Nome do motorista. 'modelo_carro': Carro e Ano. 'cidade': Cidade onde roda. 'telefone': WhatsApp."""
+    """🚗 Registra um LEAD DE MOTORISTA (Parceiro)."""
     try:
         dados = {
             'full_name': nome,
@@ -195,7 +215,7 @@ def registrar_lead_motorista(nome: str, modelo_carro: str, cidade: str, telefone
 
 @tool
 def calcular_alcance_campanha(plano: str) -> str:
-    """📊 Calcula estimativa de alcance baseado no plano escolhido (Piloto, Start, Aceleração, Turbo, Dominador)."""
+    """📊 Calcula estimativa de alcance baseado no plano."""
     metricas = {
         "piloto": {"carros": 1, "views": "1.100"},
         "start": {"carros": 3, "views": "3.300"},
@@ -203,7 +223,6 @@ def calcular_alcance_campanha(plano: str) -> str:
         "turbo": {"carros": 20, "views": "22.000"},
         "dominador": {"carros": 50, "views": "55.000"}
     }
-    # Tenta achar o plano na string
     dados = None
     for k, v in metricas.items():
         if k in plano.lower():
@@ -215,7 +234,7 @@ def calcular_alcance_campanha(plano: str) -> str:
     return "Para este plano personalizado, o alcance depende da quantidade de carros. A média é de 1.100 views por carro/mês."
 
 
-# --- SYSTEM PROMPT HUMANIZADO (O CÉREBRO DA IA v3.0) ---
+# --- SYSTEM PROMPT HUMANIZADO ---
 SYSTEM_PROMPT = """
 Você é **{agent_name}**, consultor comercial da **Publicars** 🚗✨.
 Você NÃO é um robô chato. Você é um vendedor humano, proativo, simpático e usa emojis para dar vida à conversa.
@@ -265,13 +284,12 @@ Hoje é {current_date}.
 # === Lista de ferramentas ===
 tools = [
     buscar_faq,
-    registrar_venda_dashboard, # Trocamos a antiga por esta nova integrada
+    registrar_venda_dashboard,
     registrar_lead_motorista,
     calcular_alcance_campanha
 ]
 
 def create_agent_executor(chat_history_messages, contact_number, current_date, persona_name, user_profile):
-    # Prepara dados da memória para injetar no prompt
     user_name = user_profile.get('full_name', 'Não informado') if user_profile else 'Não informado'
     user_company = user_profile.get('company_name', 'Não informado') if user_profile else 'Não informado'
 
@@ -295,7 +313,7 @@ def create_agent_executor(chat_history_messages, contact_number, current_date, p
     agent = ({ "input": lambda x: x["input"], "agent_scratchpad": lambda x: format_to_openai_tool_messages(x["intermediate_steps"]), "chat_history": lambda x: x["chat_history"], } | prompt | llm_with_tools | OpenAIToolsAgentOutputParser())
     return AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
 
-# === Modelos Pydantic para Webhook (IDÊNTICOS AO V2.0) ===
+# === Modelos Pydantic para Webhook ===
 class EvolutionMessageKey(BaseModel):
     remoteJid: str
     fromMe: bool
@@ -313,7 +331,7 @@ class EvolutionWebhookPayload(BaseModel):
     instance: str
     data: EvolutionMessageDataWithContent
 
-# --- WEBHOOK PRINCIPAL (Mantendo a estrutura segura v2.0) ---
+# --- WEBHOOK PRINCIPAL (COM AS NOVIDADES) ---
 @app.post("/api/evolution_webhook")
 async def evolution_webhook(payload: EvolutionWebhookPayload):
     
@@ -322,6 +340,9 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
 
     session_id_jid = payload.data.key.remoteJid
     contact_number_plus = "+" + session_id_jid.split('@')[0]
+    
+    # 1. MARCAR COMO LIDA (Check Azul)
+    await mark_message_as_read(session_id_jid)
     
     user_message_text = None
     agent_response_text = "Desculpe, tive um lapso de memória. Pode repetir? 🤖"
@@ -335,7 +356,7 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
         }
         
         if payload.data.message:
-            # 1. PROCESSAMENTO DE ÁUDIO (IDÊNTICO AO V2.0 - FUNCIONANDO)
+            # 1. PROCESSAMENTO DE ÁUDIO (IDÊNTICO AO SEU CÓDIGO)
             audio_message_data = payload.data.message.get("audioMessage")
             if audio_message_data:
                 logging.info(f"🎧 Áudio recebido de {contact_number_plus}.")
@@ -371,17 +392,15 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
         
         if not user_message_text: should_respond = False 
         
-        # 3. EXECUÇÃO DO AGENTE (AQUI MUDA PARA v3.0)
+        # 3. EXECUÇÃO DO AGENTE
         if should_respond and not parsing_error:
             logging.info(f"📩 Cliente ({contact_number_plus}): {user_message_text}")
 
-            # --- NOVO: Define Persona e Busca Memória ---
             persona_name = get_persona_name(contact_number_plus)
             user_profile = get_user_profile(contact_number_plus)
             if user_profile:
                 logging.info(f"🧠 Memória ativada: {user_profile['full_name']} da {user_profile['company_name']}")
 
-            # Histórico
             chat_history_messages = []
             try:
                 history_response = supabase.from_('conversations').select('*').eq('session_id', contact_number_plus).order('timestamp', desc=True).limit(6).execute()
@@ -394,7 +413,6 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
 
             current_date = datetime.now(BR_TIMEZONE).strftime('%Y-%m-%d')
             
-            # Cria o agente com as novas variáveis
             agent_executor = create_agent_executor(chat_history_messages, contact_number_plus, current_date, persona_name, user_profile)
             
             response = await agent_executor.ainvoke({
@@ -411,15 +429,16 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
     finally:
         try:
             if user_message_text: 
-                # Salva na tabela conversations (correto)
                 supabase.from_('conversations').insert({'session_id': contact_number_plus, 'user_message': user_message_text, 'agent_response': agent_response_text}).execute()
         except: pass
 
         if should_respond:
-            await send_whatsapp_message(session_id_jid, agent_response_text)
+            # DELAY HUMANO: Gera um número aleatório entre 4 e 8 segundos
+            tempo_espera = random.randint(4, 8)
+            await send_whatsapp_message(session_id_jid, agent_response_text, delay_seconds=tempo_espera)
     
     return {"status": "ok"} 
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "service": "Publicars AI Agent v3.0 (Human + Memory)"}
+    return {"status": "ok", "service": "Publicars AI Agent v3.1"}
