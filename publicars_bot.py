@@ -1,5 +1,5 @@
-# --- VERSÃO v3.1 - PUBLICARS HUMANIZADO + FIX DASHBOARD + DELAY REAL ---
-# Baseado na sua versão estável v3.0
+# --- VERSÃO v3.2 - PUBLICARS: HUMANIZADO + DASHBOARD OK + LEI DO SILÊNCIO ---
+# Baseado na sua versão v3.1 estável
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -173,14 +173,13 @@ def registrar_venda_dashboard(nome: str, empresa: str, plano: str, telefone: str
         try: supabase.from_('leads').insert(dados_lead).execute()
         except: pass
 
-        # 2. Salva na tabela PEDIDOS_ANUNCIOS (CORRIGIDO PARA O SEU DASHBOARD)
-        # Atenção: Aqui usamos os nomes de colunas que vimos na sua imagem
+        # 2. Salva na tabela PEDIDOS_ANUNCIOS (COM SEUS AJUSTES DE COLUNA)
         dados_dashboard = {
-            'nome_responsavel': nome,      # Corrigido de 'responsavel' para 'nome_responsavel'
-            'nome_empresa': empresa,       # Corrigido de 'empresa' para 'nome_empresa'
-            'whatsapp': telefone,          # Corrigido de 'telefone' para 'whatsapp'
-            'pacote_escolhido': plano,     # Requer a coluna nova 'pacote_escolhido'
-            'status': 'NOVO',              # Requer a coluna nova 'status'
+            'nome_responsavel': nome,      # Mantido conforme seu código
+            'nome_empresa': empresa,       # Mantido conforme seu código
+            'whatsapp': telefone,          # Mantido conforme seu código
+            'pacote_escolhido': plano,     # Mantido conforme seu código
+            'status': 'NOVO',              # Mantido conforme seu código
             # Se sua tabela tiver 'created_at' automático, não precisa mandar data_criacao
         }
         
@@ -234,7 +233,7 @@ def calcular_alcance_campanha(plano: str) -> str:
     return "Para este plano personalizado, o alcance depende da quantidade de carros. A média é de 1.100 views por carro/mês."
 
 
-# --- SYSTEM PROMPT HUMANIZADO ---
+# --- SYSTEM PROMPT HUMANIZADO (AGORA COM LEI DO SILÊNCIO) ---
 SYSTEM_PROMPT = """
 Você é **{agent_name}**, consultor comercial da **Publicars** 🚗✨.
 Você NÃO é um robô chato. Você é um vendedor humano, proativo, simpático e usa emojis para dar vida à conversa.
@@ -244,6 +243,11 @@ Você NÃO é um robô chato. Você é um vendedor humano, proativo, simpático 
 2.  **Seja direto:** Responda o que foi perguntado, depois venda.
 3.  **Humanize:** Use expressões como "Show de bola", "Com certeza", "Olha só", "Deixa eu te explicar".
 4.  **Memória:** Se você já sabe o nome ou a empresa do cliente (pelos dados de contexto abaixo), **NÃO PERGUNTE DE NOVO**. Apenas confirme: "Como vai a [Nome da Empresa], [Nome]?"
+
+**REGRA DE OURO - ENCERRAMENTO (LEI DO SILÊNCIO):**
+Se o cliente mandar mensagens curtas de encerramento (ex: 'ok', 'valeu', 'tchau', 'até', 'outro', 'obrigado') E você já tiver se despedido ou o assunto principal já tiver sido resolvido:
+**NÃO RESPONDA NADA.** Retorne APENAS a string: `[SILENCE]`
+(Isso fará com que o sistema pare de responder e evite loops de despedida).
 
 **DADOS DO CLIENTE (MEMÓRIA):**
 Nome Conhecido: {user_name}
@@ -290,6 +294,7 @@ tools = [
 ]
 
 def create_agent_executor(chat_history_messages, contact_number, current_date, persona_name, user_profile):
+    # Prepara dados da memória para injetar no prompt
     user_name = user_profile.get('full_name', 'Não informado') if user_profile else 'Não informado'
     user_company = user_profile.get('company_name', 'Não informado') if user_profile else 'Não informado'
 
@@ -420,7 +425,13 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
                 "chat_history": chat_history_messages
             })
             agent_response_text = response["output"]
-            logging.info(f"🤖 {persona_name}: {agent_response_text[:50]}...")
+            
+            # --- LEI DO SILÊNCIO (NOVO) ---
+            if "[SILENCE]" in agent_response_text:
+                logging.info(f"🤫 Bot decidiu encerrar a conversa (Silêncio).")
+                should_respond = False
+            else:
+                logging.info(f"🤖 {persona_name}: {agent_response_text[:50]}...")
 
     except Exception as e:
         logging.error(f"💥 Erro no Webhook: {e}", exc_info=True)
@@ -428,7 +439,8 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
 
     finally:
         try:
-            if user_message_text: 
+            # Só salva no banco se não for silêncio e se tiver mensagem
+            if user_message_text and should_respond: 
                 supabase.from_('conversations').insert({'session_id': contact_number_plus, 'user_message': user_message_text, 'agent_response': agent_response_text}).execute()
         except: pass
 
@@ -441,4 +453,4 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "service": "Publicars AI Agent v3.1"}
+    return {"status": "ok", "service": "Publicars AI Agent v3.2 (Silence Mode)"}
