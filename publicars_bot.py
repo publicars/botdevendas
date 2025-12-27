@@ -1,7 +1,8 @@
-# --- VERSÃO v3.3 - PUBLICARS: RESUMO INTELIGENTE + CADASTRO MOTORISTAS FULL ---
-# Baseado na versão v3.2 estável
+# --- VERSÃO v3.5 - PUBLICARS: ARQUIVOS LOCAIS + VPS STORAGE ---
+# Baseado na versão v3.3 otimizada
 
 from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.staticfiles import StaticFiles # Adicionado para servir arquivos
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import os
@@ -16,6 +17,7 @@ from typing import Union, Optional
 import io 
 import base64 
 import json
+import uuid # Adicionado para nomes únicos
 
 # Supabase Client
 from supabase import create_client, Client
@@ -45,13 +47,21 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+# URL Base para gerar os links dos arquivos (Ajuste se mudar de domínio)
+APP_BASE_URL = os.getenv("APP_BASE_URL", "https://bot.publicars.com.br")
+
 HUMAN_SUPPORT_PHONE = "(51) 99300-1678" 
 BR_TIMEZONE = pytz.timezone('America/Sao_Paulo')
+UPLOAD_DIR = "uploads" # Pasta local onde os arquivos serão salvos
 
 # --- Inicialização ---
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 httpx_client = httpx.AsyncClient(timeout=60.0)
+
+# 1. Configura a pasta de Uploads como pública
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 if not all([EVOLUTION_API_URL, EVOLUTION_API_KEY, EVOLUTION_INSTANCE_NAME, OPENAI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     logging.critical("⚠️ ERRO CRÍTICO: Variáveis de ambiente faltando!")
@@ -87,6 +97,31 @@ def get_user_profile(phone_number: str):
         return None
     except Exception as e:
         logging.error(f"Erro ao buscar memória: {e}")
+        return None
+
+# --- FUNÇÕES DE ARQUIVOS (NOVO) ---
+
+async def save_local_file(base64_data: str, mime_type: str, phone: str) -> str:
+    """Salva arquivo na VPS e retorna o Link Público."""
+    try:
+        file_data = base64.b64decode(base64_data)
+        
+        # Mapeia extensão
+        ext_map = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf", "video/mp4": "mp4"}
+        ext = ext_map.get(mime_type.split(';')[0], "bin")
+        
+        # Nome único: telefone_timestamp_uuid.ext
+        filename = f"{phone}_{int(datetime.now().timestamp())}_{str(uuid.uuid4())[:4]}.{ext}"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        
+        # Escreve no disco
+        with open(filepath, "wb") as f:
+            f.write(file_data)
+        
+        # Gera Link: https://dominio.com/uploads/nome.jpg
+        return f"{APP_BASE_URL}/uploads/{filename}"
+    except Exception as e:
+        logging.error(f"Erro ao salvar arquivo local: {e}")
         return None
 
 # --- FUNÇÕES DE INTERAÇÃO ---
@@ -156,14 +191,14 @@ def registrar_venda_dashboard(nome: str, empresa: str, plano: str, telefone: str
         try: supabase.from_('leads').insert(dados_lead).execute()
         except: pass
 
-        # 2. Painel Principal (PEDIDOS_ANUNCIOS) - Agora com OBSERVAÇÕES
+        # 2. Painel Principal (PEDIDOS_ANUNCIOS)
         dados_dashboard = {
             'nome_responsavel': nome,
             'nome_empresa': empresa,
             'whatsapp': telefone,
             'pacote_escolhido': plano,
             'status': 'NOVO',
-            'observacoes': resumo_conversa # NOVO CAMPO
+            'observacoes': resumo_conversa
         }
         
         try:
@@ -195,7 +230,6 @@ def registrar_lead_motorista(nome: str, telefone: str, cidade_residencia: str, e
             supabase.from_('motoristas').insert(dados_motorista).execute()
             return "✅ Cadastro de motorista realizado com sucesso no banco de dados!"
         except Exception as e_mot:
-            # Fallback para tabela leads se der erro na tabela motoristas
             logging.error(f"Erro ao salvar em motoristas: {e_mot}")
             return "Erro ao salvar na tabela específica, mas anotei os dados."
             
@@ -220,6 +254,14 @@ def calcular_alcance_campanha(plano: str) -> str:
 SYSTEM_PROMPT = """
 Você é **{agent_name}**, consultor comercial da **Publicars** 🚗✨.
 Você é humano, proativo e usa emojis.
+
+**SEU OBJETIVO:**
+Vender planos de mídia DOOH ou cadastrar motoristas parceiros.
+
+**ARQUIVOS E FOTOS:**
+Se o sistema te avisar que o usuário enviou um arquivo ou foto (URL):
+- Se for Motorista: Agradeça e diga que o documento foi recebido.
+- Se for Anunciante: Confirme o recebimento da arte/logo.
 
 **ESTILO DE WHATSAPP:**
 1. Use quebras de linha.
@@ -304,7 +346,11 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
     try:
         message_content = data.get('message', {})
         
-        # Áudio
+        # 1. TRATAMENTO DE TEXTO
+        if not user_message_text: user_message_text = message_content.get("conversation")
+        if not user_message_text: user_message_text = message_content.get("extendedTextMessage", {}).get("text")
+
+        # 2. TRATAMENTO DE ÁUDIO
         audio_msg = message_content.get("audioMessage")
         if audio_msg:
             logging.info(f"🎧 Áudio de {contact_number_plus}")
@@ -316,8 +362,29 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
                     b64 = res.json().get("base64")
                     if b64: user_message_text = await transcribe_audio(base64.b64decode(b64), ".ogg")
             except: pass
-        else:
-            user_message_text = message_content.get("conversation") or message_content.get("extendedTextMessage", {}).get("text")
+
+        # 3. TRATAMENTO DE MÍDIA (FOTOS/DOCS) - ADICIONADO AGORA
+        media_msg = message_content.get("imageMessage") or message_content.get("documentMessage")
+        if media_msg:
+            logging.info(f"📎 Arquivo recebido de {contact_number_plus}")
+            mime_type = media_msg.get("mimetype")
+            message_id = key.get('id')
+            try:
+                # Baixa o arquivo da Evolution
+                dec_url = f"{EVOLUTION_API_URL}/chat/getBase64FromMediaMessage/{EVOLUTION_INSTANCE_NAME}"
+                res = await httpx_client.post(dec_url, json={"message":{"key":{"id":message_id}},"convertToMp4":False}, headers={"apiKey":EVOLUTION_API_KEY})
+                
+                if res.status_code == 200:
+                    b64 = res.json().get("base64")
+                    if b64:
+                        # SALVA NA VPS
+                        file_url = await save_local_file(b64, mime_type, contact_number_plus)
+                        if file_url:
+                            # Injeta no contexto do bot para ele saber que recebeu
+                            caption = media_msg.get("caption", "")
+                            user_message_text = f"[SISTEMA: Usuário enviou arquivo/foto. Link: {file_url}]. {caption}"
+            except Exception as e:
+                logging.error(f"Erro processando mídia: {e}")
 
         if not user_message_text: should_respond = False
 
@@ -365,4 +432,4 @@ async def evolution_webhook(payload: EvolutionWebhookPayload):
     return {"status": "ok"} 
 
 @app.get("/api/health")
-def health_check(): return {"status": "ok", "service": "Publicars AI Agent v3.3 (Full Features)"}
+def health_check(): return {"status": "ok", "service": "Publicars AI Agent v3.5 (Local Storage)"}
